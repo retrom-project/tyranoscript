@@ -39,6 +39,11 @@ review workflows, credentials, or private games.
 - The bridge protocol must remain host-independent and strict: lifecycle
   ready/exit, pause/resume, standard browser gamepads, screenshot, and bounded
   checkpoint creation/restoration belong to the public runtime boundary.
+- Standard-gamepad admission requires directions and confirmation; cancellation
+  is optional, and existing working cancellation is retained. Each button maps to
+  one target input per configuration. Engines without the event API use only the
+  legacy keyboard mapping; never emit parallel gamepad events for that press.
+  Modern engine gamepad handling and real keyboard input remain independent.
 - A checkpoint must restore directly in a fresh page to the captured scenario
   state without opening the game's load menu. BGM state and post-restore input
   are part of the restore contract.

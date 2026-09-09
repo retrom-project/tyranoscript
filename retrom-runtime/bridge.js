@@ -44,10 +44,7 @@
     const mutedAutoplayMedia = new Set();
     const pendingAnimations = new WeakMap();
 
-    const legacyButtonNames = [
-        "A", "B", "X", "Y", "L1", "R1", "L2", "R2", "SELECT", "START", "L3", "R3",
-        "UP", "DOWN", "LEFT", "RIGHT", "HOME",
-    ];
+    const LEGACY_GAMEPAD_BUTTON_COUNT = 17;
     const legacyButtonKeys = new Map([
         [0, ["Enter", 13]], [1, ["Escape", 27]], [2, [" ", 32]], [3, ["y", 89]],
         [8, ["Backspace", 8]], [9, ["Enter", 13]], [12, ["ArrowUp", 38]],
@@ -73,7 +70,8 @@
     function engineInitialized(kag) {
         return Boolean(kag && kag.menu && kag.menu.kag === kag && kag.ftag && kag.ftag.kag === kag &&
             kag.layer && kag.layer.kag === kag && kag.key_mouse && kag.key_mouse.kag === kag &&
-            kag.event && kag.event.kag === kag && kag.chara && kag.chara.kag === kag);
+            kag.event && kag.event.kag === kag &&
+            (kag.chara ? kag.chara.kag === kag : legacyKag === kag));
     }
 
     function eventIdentity(value) {
@@ -118,6 +116,9 @@
             const result = nativeLegacyMediaPlay.apply(media, arguments);
             if (!result || typeof result.catch !== "function") return result;
             return result.catch((error) => {
+                // Legacy games discard play promises when pausing/replacing BGM
+                // during restore. A paused media element confirms cancellation.
+                if (error && error.name === "AbortError" && media.paused) return;
                 if (!error || error.name !== "NotAllowedError" || typeof media.dispatchEvent !== "function") {
                     throw error;
                 }
@@ -311,10 +312,13 @@
         if (exited || !engineInitialized(kag) || !kag.stat || typeof kag.stat.current_scenario !== "string" ||
             !kag.stat.current_scenario || kag.stat.is_wait || kag.stat.is_adding_text ||
             !stableCheckpointTag(kag)) return false;
-        const canShowMenu = kag.key_mouse && kag.key_mouse.util && kag.key_mouse.util.canShowMenu;
+        const controls = kag.key_mouse;
+        const menuOwner = controls && controls.util && typeof controls.util.canShowMenu === "function"
+            ? controls.util : controls;
+        const canShowMenu = menuOwner && menuOwner.canShowMenu;
         if (typeof canShowMenu !== "function") return true;
         try {
-            return Boolean(canShowMenu.call(kag.key_mouse.util));
+            return Boolean(canShowMenu.call(menuOwner));
         } catch {
             return false;
         }
@@ -340,7 +344,7 @@
     function pollLegacyGamepad(kag) {
         if (kag !== legacyKag || exited || paused) return;
         const gamepad = standardGamepad();
-        const pressed = legacyButtonNames.map((_, index) => Boolean(
+        const pressed = Array.from({ length: LEGACY_GAMEPAD_BUTTON_COUNT }, (_, index) => Boolean(
             gamepad && gamepad.buttons && gamepad.buttons[index] && gamepad.buttons[index].pressed,
         ));
         if (!legacyInputArmed) {
@@ -350,25 +354,14 @@
         }
         pressed.forEach((active, index) => {
             if (active === Boolean(legacyButtons[index])) return;
-            emitLegacyGamepad(kag, gamepad, index, active);
+            emitLegacyGamepad(index, active);
         });
         legacyButtons = pressed;
     }
 
-    function emitLegacyGamepad(kag, gamepad, index, pressed) {
-        const detail = {
-            button_index: index,
-            button_name: legacyButtonNames[index],
-            gamepad,
-            gamepad_index: gamepad ? gamepad.index : 0,
-        };
-        const type = pressed ? "gamepad-pressdown" : "gamepad-pressup";
-        kag.trigger(type, { detail, type });
-        if (global.document && typeof global.CustomEvent === "function") {
-            global.document.dispatchEvent(new global.CustomEvent(
-                pressed ? "gamepadpressdown" : "gamepadpressup", { detail },
-            ));
-        }
+    function emitLegacyGamepad(index, pressed) {
+        // Engines without the event API consume keyboard controls. Project each
+        // button only through that path; parallel gamepad events double actions.
         const key = legacyButtonKeys.get(index);
         if (key) dispatchLegacyKey(pressed ? "keydown" : "keyup", key[0], key[1]);
     }
@@ -389,7 +382,7 @@
     function releaseLegacyInput() {
         if (legacyKag) {
             legacyButtons.forEach((pressed, index) => {
-                if (pressed) emitLegacyGamepad(legacyKag, null, index, false);
+                if (pressed) emitLegacyGamepad(index, false);
             });
         }
         legacyButtons = [];
@@ -945,6 +938,14 @@
                 case "RESUME":
                     resume();
                     send(requestId, "RESUME_RESULT", {});
+                    break;
+                case "SET_VIDEO_MODE":
+                    if (!ownKeys(message.body, ["mode"]) || !["pixel", "smooth"].includes(message.body.mode)) {
+                        throw new Error("TYRANOSCRIPT_PROTOCOL_INVALID");
+                    }
+                    global.document.documentElement.style.setProperty("image-rendering",
+                        message.body.mode === "pixel" ? "pixelated" : "auto", "important");
+                    send(requestId, "SET_VIDEO_MODE_RESULT", {});
                     break;
                 case "SET_VOLUME":
                     if (!ownKeys(message.body, ["value"])) throw new Error("TYRANOSCRIPT_PROTOCOL_INVALID");
