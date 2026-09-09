@@ -14,6 +14,8 @@ function runtimeFixture({
     emitLoadComplete = true,
     checkpointReady = true,
     legacyEngine = false,
+    missingChara = false,
+    mediaPlayError = null,
     legacyMedia = false,
     engineReadyAtConnect = true,
     menuReadyAtConnect = true,
@@ -28,6 +30,7 @@ function runtimeFixture({
     const intervalCallbacks = new Map();
     const replies = [];
     const actions = [];
+    const documentEvents = [];
     let closeCalls = 0;
     let restoreOptions = null;
     let canShowMenu = checkpointReady;
@@ -108,12 +111,16 @@ function runtimeFixture({
             if (eventName.startsWith(".")) engineListeners.clear();
         };
     } else {
+        delete kag.chara;
+        kag.key_mouse.canShowMenu = kag.key_mouse.util.canShowMenu;
+        delete kag.key_mouse.util;
         delete kag.weaklyStop;
         delete kag.cancelWeakStop;
     }
-    for (const component of [kag.chara, kag.event, kag.ftag, kag.key_mouse, kag.layer, kag.menu]) {
+    for (const component of [kag.chara, kag.event, kag.ftag, kag.key_mouse, kag.layer, kag.menu].filter(Boolean)) {
         component.kag = menuReadyAtConnect ? kag : null;
     }
+    if (missingChara) delete kag.chara;
     const howl = {
         _sounds: [{ _id: 7 }],
         pause(id) { actions.push(`audio-pause:${id}`); },
@@ -153,6 +160,7 @@ function runtimeFixture({
         dispatchEvent(event) { actions.push(`blocked-media:${event.type}`); }
         play() {
             actions.push("blocked-media:native-play");
+            if (mediaPlayError) return Promise.reject(Object.assign(new Error("media play failed"), {name:mediaPlayError}));
             if (this.tagName === "VIDEO" && this.muted) {
                 this.paused = false;
                 return Promise.resolve();
@@ -209,10 +217,11 @@ function runtimeFixture({
             constructor(type, init) { this.type = type; this.detail = init.detail; }
         },
         Event: class Event {
-            constructor(type) { this.type = type; }
+            constructor(type, init) { this.type = type; Object.assign(this, init); }
         },
         HTMLMediaElement: BlockedHTMLMediaElement,
         document: {
+            documentElement: { style: { setProperty(name, value, priority) { actions.push(`${name}:${value}:${priority}`); } } },
             addEventListener(name) { actions.push(`document-listen:${name}`); },
             createElement(name) {
                 if (!blockedLegacyAudio || name !== "audio") return {};
@@ -221,7 +230,7 @@ function runtimeFixture({
                 mediaElement.src = "";
                 return mediaElement;
             },
-            dispatchEvent(event) { actions.push(`document:${event.type}`); },
+            dispatchEvent(event) { actions.push(`document:${event.type}`); documentEvents.push(event); },
             querySelectorAll(selector) {
                 if (selector === ".animated") return stalledAnimation ? [animated] : [];
                 if (selector === "video[autoplay]") {
@@ -232,7 +241,7 @@ function runtimeFixture({
             removeEventListener(name) { actions.push(`document-unlisten:${name}`); },
         },
         KeyboardEvent: class KeyboardEvent {
-            constructor(type) { this.type = type; }
+            constructor(type, init) { this.type = type; Object.assign(this, init); }
         },
         navigator: {
             userActivation: blockedLegacyAudio ? { hasBeenActive: false, isActive: false } : undefined,
@@ -312,6 +321,7 @@ function runtimeFixture({
 
     return {
         actions,
+        documentEvents,
         autoplayVideo,
         advanceTime(milliseconds) { now += milliseconds; },
         closeCalls: () => closeCalls,
@@ -332,7 +342,7 @@ function runtimeFixture({
         setCurrentTag(name) { kag.ftag.array_tag[0].name = name; },
         setEngineReady() { runtime.TYRANO.kag = kag; },
         setMenuReady() {
-            for (const component of [kag.chara, kag.event, kag.ftag, kag.key_mouse, kag.layer, kag.menu]) {
+            for (const component of [kag.chara, kag.event, kag.ftag, kag.key_mouse, kag.layer, kag.menu].filter(Boolean)) {
                 component.kag = kag;
             }
         },
@@ -531,16 +541,31 @@ test("checkpoints and restores a TyranoScript 4.x snapshot without modern event 
     assert.equal(fixture.kag.stat.f.marker, "B");
 });
 
-test("projects a standard gamepad B edge through the TyranoScript 4.x event facade", () => {
+test("uses one keyboard target per legacy gamepad button without emitting duplicate gamepad events", () => {
     const fixture = runtimeFixture({ legacyEngine: true });
-    let observed = null;
-    fixture.kag.once("gamepad-pressdown.retrom-test", (event) => { observed = event.detail.button_name; });
+    const projected = [];
+    fixture.kag.on("gamepad-pressdown.retrom-test", (event) => projected.push(event));
+    fixture.kag.on("gamepad-pressup.retrom-test", (event) => projected.push(event));
+    const keys = new Map([[0, "Enter"], [1, "Escape"], [2, " "], [3, "y"], [8, "Backspace"],
+        [9, "Enter"], [12, "ArrowUp"], [13, "ArrowDown"], [14, "ArrowLeft"], [15, "ArrowRight"]]);
+    for (let button = 0; button < 17; button++) {
+        fixture.documentEvents.length = 0;
+        fixture.setGamepadButton(button, true); fixture.tick(); fixture.tick();
+        fixture.setGamepadButton(button, false); fixture.tick();
+        assert.deepEqual(fixture.documentEvents.map((event) => [event.type, event.key]), keys.has(button)
+            ? [["keydown", keys.get(button)], ["keyup", keys.get(button)]] : []);
+    }
+    assert.deepEqual(projected, []);
+});
 
-    fixture.setGamepadButton(1, true);
-    fixture.tick();
-
-    assert.equal(observed, "B");
-    assert.equal(fixture.actions.includes("document:keydown"), true);
+test("releases the legacy keyboard target on pause without a second gamepad input path", async () => {
+    const fixture = runtimeFixture({ legacyEngine: true });
+    fixture.setGamepadButton(1, true); fixture.tick();
+    await fixture.request("PAUSE");
+    assert.deepEqual(fixture.documentEvents.map((event) => [event.type, event.key]),
+        [["keydown", "Escape"], ["keyup", "Escape"]]);
+    await fixture.request("RESUME"); fixture.tick();
+    assert.equal(fixture.documentEvents.length, 2);
 });
 
 test("pauses, resumes, and changes volume on TyranoScript 4.x HTML media", async () => {
@@ -610,4 +635,34 @@ test("rejects a malformed restore without mutating the running scene", async () 
     assert.equal(reply.type, "ERROR");
     assert.deepEqual(plain(reply.body), { code: "TYRANOSCRIPT_CHECKPOINT_INVALID" });
     assert.equal(fixture.kag.stat.f.marker, "A");
+});
+
+test("applies declared pixel and smooth rendering and rejects unknown modes", async () => {
+    const fixture = runtimeFixture();
+    assert.equal((await fixture.request("SET_VIDEO_MODE", {mode: "pixel"})).type, "SET_VIDEO_MODE_RESULT");
+    assert.equal((await fixture.request("SET_VIDEO_MODE", {mode: "smooth"})).type, "SET_VIDEO_MODE_RESULT");
+    assert.ok(fixture.actions.includes("image-rendering:pixelated:important"));
+    assert.ok(fixture.actions.includes("image-rendering:auto:important"));
+    assert.equal((await fixture.request("SET_VIDEO_MODE", {mode: "unknown"})).body.code, "TYRANOSCRIPT_PROTOCOL_INVALID");
+});
+
+test("missing chara is allowed only for legacy engines and legacy menu gating remains enforced", async () => {
+    const modern = runtimeFixture({missingChara:true});
+    assert.equal((await modern.request("PROBE")).body.checkpointAvailable, false);
+    const legacy = runtimeFixture({legacyEngine:true,checkpointReady:false});
+    assert.equal((await legacy.request("PROBE")).body.checkpointAvailable, false);
+    legacy.setCheckpointReady(true);
+    assert.equal((await legacy.request("PROBE")).body.checkpointAvailable, true);
+});
+
+test("legacy media tolerates paused AbortError while preserving other play failures", async () => {
+    const fixture = runtimeFixture({legacyEngine:true,blockedLegacyAudio:true,mediaPlayError:"AbortError"});
+    fixture.runtime.navigator.userActivation.hasBeenActive = true;
+    const media = new fixture.runtime.HTMLMediaElement();
+    await assert.doesNotReject(media.play());
+    media.paused = false;
+    await assert.rejects(media.play(), {name:"AbortError"});
+    const broken = runtimeFixture({legacyEngine:true,blockedLegacyAudio:true,mediaPlayError:"NotSupportedError"});
+    broken.runtime.navigator.userActivation.hasBeenActive = true;
+    await assert.rejects(new broken.runtime.HTMLMediaElement().play(), {name:"NotSupportedError"});
 });
